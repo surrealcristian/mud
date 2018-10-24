@@ -1,103 +1,135 @@
 package main
 
 import (
+	"bufio"
 	"fmt"
 	"net"
+	"os"
+	"sync"
 )
 
-type Server struct {
-	Listener  net.Listener
-	NewConns  chan net.Conn
-	DeadConns chan net.Conn
+// ConnManager
+
+type ConnManager struct {
+	connMap map[net.Conn]bool
+	mux     sync.RWMutex
 }
 
-func NewServer(listener net.Listener, newConnsBufSize int, deadConnsBufSize int) *Server {
-	return &Server{
-		Listener:  listener,
-		NewConns:  make(chan net.Conn, newConnsBufSize),
-		DeadConns: make(chan net.Conn, deadConnsBufSize),
+func NewConnManager() *ConnManager {
+	return &ConnManager{connMap: make(map[net.Conn]bool)}
+}
+
+func (m *ConnManager) add(conn net.Conn) {
+	m.mux.Lock()
+	m.connMap[conn] = true
+	m.mux.Unlock()
+}
+
+func (m *ConnManager) remove(conn net.Conn) {
+	m.mux.Lock()
+	delete(m.connMap, conn)
+	m.mux.Unlock()
+}
+
+func (m *ConnManager) all() map[net.Conn]bool {
+	return m.connMap
+}
+
+// MudServer
+
+type MudServer struct {
+	ConnManager *ConnManager
+}
+
+func NewMudServer() *MudServer {
+	return &MudServer{ConnManager: NewConnManager()}
+}
+
+func (s *MudServer) HandleConn(conn net.Conn) {
+	s.ConnManager.add(conn)
+
+	reader := bufio.NewReader(conn)
+	scanner := bufio.NewScanner(reader)
+
+	for scanner.Scan() {
+		s.HandleMessage(scanner.Text())
 	}
+
+	err := scanner.Err()
+
+	if err == nil {
+		_ = conn.Close()
+
+		fmt.Println("CONNECTION CLOSED")
+
+		s.ConnManager.remove(conn)
+	} else {
+		fmt.Fprintln(os.Stderr, "ERROR READING CONNECTION:", err)
+	}
+
+	/*
+		buf := make([]byte, 1024)
+
+		for {
+			nbyte, err := conn.Read(buf)
+
+			if err != nil {
+				_ = conn.Close()
+
+				fmt.Println("CONNECTION CLOSED", err)
+
+				s.ConnManager.remove(conn)
+
+				break
+			}
+
+			message := make([]byte, nbyte)
+			copy(message, buf[:nbyte])
+
+			for conn, _ := range s.ConnManager.all() {
+				go s.WriteMessage(conn, message)
+			}
+		}
+	*/
 }
 
-func (s *Server) HandleAccepts() {
-	for {
-		conn, err := s.Listener.Accept()
+func (s *MudServer) HandleMessage(message string) {
+	fmt.Println(message)
+}
 
-		fmt.Println("ACCEPT")
+func (s *MudServer) WriteMessage(conn net.Conn, message []byte) {
+	total := 0
+
+	for total < len(message) {
+		n, err := conn.Write(message[total:])
 
 		if err != nil {
-			panic(err)
+			_ = conn.Close()
+			s.ConnManager.remove(conn)
+			return
 		}
 
-		s.NewConns <- conn
+		total += n
 	}
 }
 
 func main() {
-	deadConns := make(chan net.Conn, 128)
-	publishes := make(chan []byte, 128)
-	conns := make(map[net.Conn]bool)
-
 	listener, err := net.Listen("tcp", ":8080")
-
-	server := NewServer(listener, 128)
+	defer listener.Close()
 
 	if err != nil {
 		panic(err)
 	}
 
-	go server.HandleAccepts()
+	server := NewMudServer()
 
 	for {
-		select {
-		case conn := <-server.NewConns:
-			conns[conn] = true
-
-			go handleReads(conn, deadConns, publishes)
-
-		case deadConn := <-deadConns:
-			_ = deadConn.Close()
-			delete(conns, deadConn)
-
-		case publish := <-publishes:
-			for conn, _ := range conns {
-				handleWrites(conn, deadConns, publish)
-			}
-		}
-	}
-
-	listener.Close()
-}
-
-func handleReads(conn net.Conn, deadConns chan<- net.Conn, publishes chan<- []byte) {
-	buf := make([]byte, 1024)
-
-	for {
-		nbyte, err := conn.Read(buf)
+		conn, err := listener.Accept()
 
 		if err != nil {
-			deadConns <- conn
-			break
-		} else {
-			fragment := make([]byte, nbyte)
-			copy(fragment, buf[:nbyte])
-			publishes <- fragment
-		}
-	}
-}
-
-func handleWrites(conn net.Conn, deadConns chan<- net.Conn, publish []byte) {
-	totalWritten := 0
-
-	for totalWritten < len(publish) {
-		writtenThisCall, err := conn.Write(publish[totalWritten:])
-
-		if err != nil {
-			deadConns <- conn
-			break
+			panic(err)
 		}
 
-		totalWritten += writtenThisCall
+		go server.HandleConn(conn)
 	}
-
 }
